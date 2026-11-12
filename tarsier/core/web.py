@@ -188,6 +188,17 @@ class WebDesktop:
     def get_current_page(self) -> WebElement:
         return WebElement(self.page, highlight_actions=self.highlight_actions)
 
+    def start_workflow(self, scope: Optional[str] = None):
+        """Open a stable-ref workflow bound to the active browser page.
+
+        Refs are scoped to the page active at workflow creation. Switching
+        tabs, navigating or refreshing invalidates the stamped DOM ids and
+        refs fail with a recognizable TarsierRefError instead of silently
+        operating on another element.
+        """
+        from tarsier.core.web_workflow import WebWorkflow
+        return WebWorkflow(self, scope=scope)
+
     def close(self):
         if hasattr(self, 'browser') and self.browser:
             try:

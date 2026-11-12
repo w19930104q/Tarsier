@@ -192,6 +192,65 @@ with WebDesktop() as web:
     web.button("Search").click()
 ```
 
+### 3.5 Stable Refs: Workflows with Scoped, Generationed Snapshots
+
+Role/name lookups return the *first* matching element, which is ambiguous when
+a form contains several `Save` buttons and nested confirmation dialogs, and a
+redraw or window switch can leave a cached handle silently operating on a
+different control. **Workflows** solve this by issuing stable node refs.
+
+Every snapshot taken inside a workflow is bound to:
+
+* a **scope** – the workflow id, isolated per window/tab (concurrent workflows
+  never share refs);
+* a **generation** – a monotonic snapshot version. Taking a new snapshot bumps
+  the generation and expires every ref from earlier snapshots.
+
+Refs are opaque strings (`tarsier-ref/v1/<scope>/<generation>/<node-id>`)
+emitted as `# ...` annotations on each YAML node. Actions re-validate the ref
+against the *live* accessibility tree / DOM before acting, and every failure
+raises a recognizable error with a stable machine-readable `code`:
+
+| Code | Meaning | Required recovery |
+| :--- | :--- | :--- |
+| `ref_format_error` | Not a well-formed tarsier ref | Fix the ref string |
+| `ref_scope_error` | Ref belongs to another/closed workflow, window or tab | Start a workflow in the right scope |
+| `ref_generation_expired` | A newer snapshot exists in this scope | **Re-snapshot and use the new ref** |
+| `ref_target_replaced` | The node was removed/replaced (redraw, refresh) | Re-snapshot and use the new ref |
+| `ref_out_of_scope` | The node moved outside the active window/tab | Switch back or start a new workflow |
+
+```python
+from tarsier import Desktop, RefGenerationExpiredError
+
+desktop = Desktop()
+with desktop.start_workflow("Untitled - Notepad") as wf:
+    snapshot = wf.snapshot()
+    print(snapshot.to_yaml())
+    # - button "Save":  # tarsier-ref/v1/wf-000001/1/uia/42/..
+    # - dialog "Confirm Save":
+    #   - button "Save":  # tarsier-ref/v1/wf-000001/1/uia/77/..
+
+    save_ref = next(
+        node.ref for node in snapshot.root.iter_nodes()
+        if node.role == "button" and node.node_id.endswith("77")
+    )
+    wf.click(save_ref)          # exact node, never the first role/name match
+    wf.type(text_ref, "hello")  # stable input targeting
+    wf.read(text_ref)           # stable read
+
+    wf.snapshot()               # redraw/dialog handled: generation 2
+    try:
+        wf.click(save_ref)      # stale generation -> loud error, no silent click
+    except RefGenerationExpiredError as exc:
+        assert exc.code == "ref_generation_expired"
+```
+
+The same API exists for the web (`WebDesktop.start_workflow()`), where DOM
+nodes are stamped with `data-tarsier-id`; reloads and framework re-renders
+drop those stamps, so stale refs fail with `ref_target_replaced` instead of
+hitting a replacement element. Legacy `role`/`name` calls continue to work
+unchanged; refs are strictly opt-in.
+
 ### 4. Window Management
 Modify workspace coordinates using native OS Window Transform patterns:
 
@@ -225,7 +284,29 @@ Tarsier-AI comes with a built-in **Model Context Protocol (MCP)** server, standa
 
 ### Available MCP Tools
 
-The Tarsier MCP server exposes **21 tools** categorized into Desktop and Web automation blocks.
+The Tarsier MCP server exposes **29 tools** categorized into stable-ref
+workflow tools plus the legacy Desktop and Web automation blocks.
+
+#### 🧭 Stable-Ref Workflow Tools (8 Tools)
+
+* 🆕 **`desktop_start_workflow`** / **`web_start_workflow`**
+  * Opens a ref scope bound to one window / browser tab and returns its `scope` id.
+* 🆕 **`desktop_snapshot(scope, include_refs=True)`** / **`web_snapshot(...)`**
+  * Returns the generationed YAML snapshot; each node carries a
+    `# tarsier-ref/v1/<scope>/<generation>/<node>` annotation. Re-calling
+    bumps the generation and expires older refs. Set `include_refs=False` for
+    plain legacy YAML.
+* 🆕 **`ref_click(scope, ref)`**, **`ref_type(scope, ref, text)`**, **`ref_read_text(scope, ref)`**
+  * Act on the exact snapshot node. Failures return a recognizable
+    `[ref_format_error]` / `[ref_scope_error]` / `[ref_generation_expired]` /
+    `[ref_target_replaced]` / `[ref_out_of_scope]` string instead of silently
+    falling back to a role/name match.
+* 🆕 **`end_workflow(scope)`** – closes a scope and releases its registries.
+
+All legacy action tools (`desktop_click`, `desktop_type`, `desktop_read_text`,
+`web_click`, `web_type`, `web_read_text`) additionally accept optional
+`ref` + `scope` arguments; when supplied they target the exact snapshot node,
+otherwise the original role/name/selector first-match behavior is preserved.
 
 #### 🖥️ Desktop Automation Tools (11 Tools)
 

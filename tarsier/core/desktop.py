@@ -433,3 +433,16 @@ class Desktop:
     def drag_and_drop(self, source_element: UIElement, target_element: UIElement, move_speed: int = 1, wait_time: float = 0.5) -> 'Desktop':
         self._backend.drag_and_drop(source_element, target_element, move_speed, wait_time)
         return self
+
+    def start_workflow(self, window_name: str, scope: Optional[str] = None):
+        """Open a stable-ref workflow bound to one window.
+
+        The returned :class:`~tarsier.core.desktop_workflow.DesktopWorkflow`
+        produces generationed snapshots whose nodes carry ``tarsier-ref``
+        strings; click/type/read accept those refs and re-validate the
+        target against the live accessibility tree before acting.
+        """
+        from tarsier.core.desktop_workflow import DesktopWorkflow
+        # Fail fast if the window cannot be resolved.
+        self.get_window(window_name)
+        return DesktopWorkflow(self, window_name, scope=scope)

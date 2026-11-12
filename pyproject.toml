@@ -37,4 +37,11 @@ dependencies = [
 tarsier-mcp = "tarsier.mcp.server:main"
 
 [tool.setuptools]
-packages = ["tarsier", "tarsier.core", "tarsier.mcp"]
+packages = ["tarsier", "tarsier.core", "tarsier.mcp", "tarsier.testing"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "playwright: tests that drive a local headless Chromium via Playwright",
+]
