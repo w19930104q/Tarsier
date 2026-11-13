@@ -1,7 +1,12 @@
 import json
 import re
 import sys
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, Optional
+
+from tarsier.core.snapshot import (
+    NodeView,
+    get_registry,
+)
 
 ROLE_MAPPING = {
     # Windows ControlTypeNames mapped to standard roles
@@ -105,6 +110,18 @@ class UIElementBackend:
     def dump_ui(self, max_depth: int = 2) -> Dict[str, Any]:
         raise NotImplementedError()
     def to_yaml_snapshot(self, max_depth: int = 15) -> str:
+        raise NotImplementedError()
+    def to_snapshot(self, max_depth: int = 15) -> Any:
+        """Builds a reference-bearing :class:`tarsier.core.snapshot.Snapshot`."""
+        raise NotImplementedError()
+    def resolve_ref(self, ref: str) -> 'UIElement':
+        """Resolves a snapshot reference against the live tree and returns the element."""
+        raise NotImplementedError()
+    def click_ref(self, ref: str) -> 'UIElementBackend':
+        raise NotImplementedError()
+    def type_ref(self, ref: str, text: str, waitTime: float = 0.05) -> 'UIElementBackend':
+        raise NotImplementedError()
+    def read_ref(self, ref: str) -> str:
         raise NotImplementedError()
 
 class WindowsUIElement(UIElementBackend):
@@ -401,39 +418,6 @@ class WindowsUIElement(UIElementBackend):
                 data["elements"] = [self._dump_recursive(c, current_depth + 1, max_depth) for c in children]
         return data
 
-    def _build_keep_set(self, control, keep_set: set) -> bool:
-        try:
-            runtime_id = control.GetRuntimeId()
-        except Exception:
-            return False
-            
-        is_meaningful = False
-        try:
-            raw_role = control.ControlTypeName.replace("Control", "").lower() or "unknown"
-            role = ROLE_MAPPING.get(raw_role, raw_role)
-            name = control.Name
-            if role in ["button", "textbox", "checkbox", "radio", "combobox", "link", "menuitem", "window", "document", "edit"]:
-                is_meaningful = True
-            elif name and name.strip():
-                is_meaningful = True
-        except Exception:
-            pass
-            
-        has_keep_child = False
-        try:
-            children = control.GetChildren()
-            if children:
-                for child in children:
-                    if self._build_keep_set(child, keep_set):
-                        has_keep_child = True
-        except Exception:
-            pass
-            
-        if is_meaningful or has_keep_child:
-            keep_set.add(runtime_id)
-            return True
-        return False
-
     def _get_content_root(self, control):
         from collections import deque
         # Phase 1: Try to find Chrome_RenderWidgetHostHWND (Chromium content viewport)
@@ -451,7 +435,7 @@ class WindowsUIElement(UIElementBackend):
                     queue.extend(children)
             except Exception:
                 pass
-                
+
         # Phase 2: Fallback to finding a document control that has children
         queue = deque([control])
         while queue:
@@ -472,52 +456,85 @@ class WindowsUIElement(UIElementBackend):
                 pass
         return control
 
-    def to_yaml_snapshot(self, max_depth: int = 15) -> str:
-        content_root = self._get_content_root(self._control)
-        lines = []
-        keep_set = set()
-        self._build_keep_set(content_root, keep_set)
-        self._to_yaml_recursive(content_root, 0, max_depth, lines, keep_set)
-        return "\n".join(lines)
-        
-    def _to_yaml_recursive(self, control, depth: int, max_depth: int, lines: List[str], keep_set: set):
+    # ------------------------------------------------------------------ #
+    # Snapshot-level stable references
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _windows_role(control) -> str:
+        raw_role = control.ControlTypeName.replace("Control", "").lower() or "unknown"
+        return ROLE_MAPPING.get(raw_role, raw_role)
+
+    def _node_id(self, control):
         try:
             runtime_id = control.GetRuntimeId()
-            if runtime_id not in keep_set:
-                return
-            raw_role = control.ControlTypeName.replace("Control", "").lower() or "unknown"
-            role = ROLE_MAPPING.get(raw_role, raw_role)
-            name = control.Name
+            return ("win-rtid",) + tuple(int(part) for part in runtime_id)
         except Exception:
-            return
-        
-        indent = "  " * depth
-        line = f"{indent}- {role}"
-        if name:
-            safe_name = name.replace('"', '\\"')
-            line += f' "{safe_name}"'
-            
+            return ("win-obj", id(control))
+
+    def _is_visible(self, control) -> bool:
         try:
-            children = control.GetChildren()
+            rect = control.BoundingRectangle
+            return rect.right > rect.left and rect.bottom > rect.top
+        except Exception:
+            return True
+
+    def _build_view(self, control=None) -> NodeView:
+        control = self._control if control is None else control
+        try:
+            role = self._windows_role(control)
+            name = control.Name or ""
+        except Exception:
+            role, name = "unknown", ""
+        view = NodeView(
+            role=role,
+            name=name,
+            node_id=self._node_id(control),
+            control=control,
+            visible=self._is_visible(control),
+        )
+        try:
+            children = control.GetChildren() or []
         except Exception:
             children = []
+        view.children = [self._build_view(child) for child in children]
+        return view
 
-        valid_children = []
-        for child in children:
-            try:
-                c_id = child.GetRuntimeId()
-                if c_id in keep_set:
-                    valid_children.append(child)
-            except Exception:
-                pass
+    def _window_key(self) -> str:
+        try:
+            hwnd = self._control.NativeWindowHandle
+            if hwnd:
+                return f"win:hwnd:{int(hwnd)}"
+        except Exception:
+            pass
+        return f"win:name:{self._control.Name or ''}"
 
-        if valid_children and depth < max_depth:
-            line += ":"
-            lines.append(line)
-            for child in valid_children:
-                self._to_yaml_recursive(child, depth + 1, max_depth, lines, keep_set)
-        else:
-            lines.append(line)
+    def to_snapshot(self, max_depth: int = 15):
+        content_root = self._get_content_root(self._control)
+        root_view = self._build_view(content_root)
+        store = get_registry().store(self._window_key())
+        return store.create(root_view, max_depth=max_depth)
+
+    def to_yaml_snapshot(self, max_depth: int = 15) -> str:
+        return self.to_snapshot(max_depth=max_depth).to_yaml()
+
+    def _live_root_view(self) -> NodeView:
+        return self._build_view(self._get_content_root(self._control))
+
+    def resolve_ref(self, ref: str) -> 'UIElement':
+        store = get_registry().store(self._window_key())
+        _, _, live_view = store.resolve(ref, live_root=self._live_root_view())
+        return UIElement(live_view.control, highlight_actions=self.highlight_actions)
+
+    def click_ref(self, ref: str) -> 'WindowsUIElement':
+        return self.resolve_ref(ref)._backend.click()
+
+    def type_ref(self, ref: str, text: str, waitTime: float = 0.05) -> 'WindowsUIElement':
+        self.resolve_ref(ref)._backend.type(text, waitTime)
+        return self
+
+    def read_ref(self, ref: str) -> str:
+        return self.resolve_ref(ref).read()
 
 class MacUIElement(UIElementBackend):
     def __init__(self, control, highlight_actions: bool = False):
@@ -764,41 +781,6 @@ class MacUIElement(UIElementBackend):
                 data["elements"] = [self._dump_recursive(c, current_depth + 1, max_depth) for c in children]
         return data
 
-    def _build_keep_set(self, control, keep_set: set) -> bool:
-        try:
-            el_role = getattr(control, 'AXRole', "unknown")
-            role = ROLE_MAPPING.get(el_role.lower(), el_role.replace("AX", "").lower())
-            name = getattr(control, 'AXTitle', "") or getattr(control, 'AXDescription', "") or ""
-        except Exception:
-            return False
-            
-        is_meaningful = False
-        if role in ["button", "textbox", "checkbox", "radio", "combobox", "link", "menuitem", "window", "document", "edit"]:
-            is_meaningful = True
-        elif name and str(name).strip():
-            is_meaningful = True
-            
-        has_keep_child = False
-        try:
-            children = getattr(control, 'AXChildren', None)
-            if children:
-                for child in children:
-                    if self._build_keep_set(child, keep_set):
-                        has_keep_child = True
-        except Exception:
-            pass
-            
-        try:
-            key = control
-            hash(key)
-        except Exception:
-            key = id(control)
-            
-        if is_meaningful or has_keep_child:
-            keep_set.add(key)
-            return True
-        return False
-
     def _get_content_root(self, control):
         from collections import deque
         queue = deque([control])
@@ -818,62 +800,84 @@ class MacUIElement(UIElementBackend):
                 pass
         return control
 
-    def to_yaml_snapshot(self, max_depth: int = 15) -> str:
+    # ------------------------------------------------------------------ #
+    # Snapshot-level stable references
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _mac_role(control) -> str:
+        el_role = getattr(control, 'AXRole', "unknown")
+        return ROLE_MAPPING.get(el_role.lower(), el_role.replace("AX", "").lower())
+
+    @staticmethod
+    def _mac_name(control) -> str:
+        return getattr(control, 'AXTitle', "") or getattr(control, 'AXDescription', "") or ""
+
+    def _node_id(self, control):
+        try:
+            hash(control)
+            return ("mac-ax", control)
+        except Exception:
+            return ("mac-obj", id(control))
+
+    def _is_visible(self, control) -> bool:
+        try:
+            hidden = getattr(control, 'AXHidden', False)
+            return not bool(hidden)
+        except Exception:
+            return True
+
+    def _build_view(self, control=None) -> NodeView:
+        control = self._control if control is None else control
+        try:
+            role = self._mac_role(control)
+            name = self._mac_name(control)
+        except Exception:
+            role, name = "unknown", ""
+        view = NodeView(
+            role=role,
+            name=str(name),
+            node_id=self._node_id(control),
+            control=control,
+            visible=self._is_visible(control),
+        )
+        try:
+            children = getattr(control, 'AXChildren', None) or []
+        except Exception:
+            children = []
+        view.children = [self._build_view(child) for child in children]
+        return view
+
+    def _window_key(self) -> str:
+        title = self._mac_name(self._control) or ""
+        return f"mac:title:{title}:obj:{id(self._control)}"
+
+    def to_snapshot(self, max_depth: int = 15):
         content_root = self._get_content_root(self._control)
-        lines = []
-        keep_set = set()
-        self._build_keep_set(content_root, keep_set)
-        self._to_yaml_recursive(content_root, 0, max_depth, lines, keep_set)
-        return "\n".join(lines)
-        
-    def _to_yaml_recursive(self, control, depth: int, max_depth: int, lines: List[str], keep_set: set):
-        try:
-            try:
-                key = control
-                hash(key)
-            except Exception:
-                key = id(control)
-            if key not in keep_set:
-                return
-                
-            el_role = getattr(control, 'AXRole', "unknown")
-            role = ROLE_MAPPING.get(el_role.lower(), el_role.replace("AX", "").lower())
-            name = getattr(control, 'AXTitle', "") or getattr(control, 'AXDescription', "") or ""
-        except Exception:
-            return
-        
-        indent = "  " * depth
-        line = f"{indent}- {role}"
-        if name:
-            safe_name = str(name).replace('"', '\\"')
-            line += f' "{safe_name}"'
-            
-        try:
-            children = getattr(control, 'AXChildren', None)
-        except Exception:
-            children = None
+        root_view = self._build_view(content_root)
+        store = get_registry().store(self._window_key())
+        return store.create(root_view, max_depth=max_depth)
 
-        valid_children = []
-        if children:
-            for child in children:
-                try:
-                    try:
-                        ckey = child
-                        hash(ckey)
-                    except Exception:
-                        ckey = id(child)
-                    if ckey in keep_set:
-                        valid_children.append(child)
-                except Exception:
-                    pass
+    def to_yaml_snapshot(self, max_depth: int = 15) -> str:
+        return self.to_snapshot(max_depth=max_depth).to_yaml()
 
-        if valid_children and depth < max_depth:
-            line += ":"
-            lines.append(line)
-            for child in valid_children:
-                self._to_yaml_recursive(child, depth + 1, max_depth, lines, keep_set)
-        else:
-            lines.append(line)
+    def _live_root_view(self) -> NodeView:
+        return self._build_view(self._get_content_root(self._control))
+
+    def resolve_ref(self, ref: str) -> 'UIElement':
+        store = get_registry().store(self._window_key())
+        _, _, live_view = store.resolve(ref, live_root=self._live_root_view())
+        return UIElement(live_view.control, highlight_actions=self.highlight_actions)
+
+    def click_ref(self, ref: str) -> 'MacUIElement':
+        return self.resolve_ref(ref)._backend.click()
+
+    def type_ref(self, ref: str, text: str, waitTime: float = 0.05) -> 'MacUIElement':
+        self.resolve_ref(ref)._backend.type(text, waitTime)
+        return self
+
+    def read_ref(self, ref: str) -> str:
+        return self.resolve_ref(ref).read()
 
 class LinuxUIElement(UIElementBackend):
     def __init__(self, control, highlight_actions: bool = False):
@@ -1110,43 +1114,6 @@ class LinuxUIElement(UIElementBackend):
                 data["elements"] = elements
         return data
 
-    def _build_keep_set(self, control, keep_set: set) -> bool:
-        try:
-            role_name = control.getRoleName() or "unknown"
-            role = ROLE_MAPPING.get(role_name.lower(), role_name.replace(" ", "_").lower())
-            name = control.name or ""
-        except Exception:
-            return False
-            
-        is_meaningful = False
-        if role in ["button", "textbox", "checkbox", "radio", "combobox", "link", "menuitem", "window", "document", "edit"]:
-            is_meaningful = True
-        elif name and name.strip():
-            is_meaningful = True
-            
-        has_keep_child = False
-        try:
-            child_count = control.childCount
-            if child_count > 0:
-                for i in range(child_count):
-                    child = control.getChildAtIndex(i)
-                    if child:
-                        if self._build_keep_set(child, keep_set):
-                            has_keep_child = True
-        except Exception:
-            pass
-            
-        try:
-            key = control
-            hash(key)
-        except Exception:
-            key = id(control)
-            
-        if is_meaningful or has_keep_child:
-            keep_set.add(key)
-            return True
-        return False
-
     def _get_content_root(self, control):
         from collections import deque
         queue = deque([control])
@@ -1169,64 +1136,86 @@ class LinuxUIElement(UIElementBackend):
                 pass
         return control
 
-    def to_yaml_snapshot(self, max_depth: int = 15) -> str:
-        content_root = self._get_content_root(self._control)
-        lines = []
-        keep_set = set()
-        self._build_keep_set(content_root, keep_set)
-        self._to_yaml_recursive(content_root, 0, max_depth, lines, keep_set)
-        return "\n".join(lines)
-        
-    def _to_yaml_recursive(self, control, depth: int, max_depth: int, lines: List[str], keep_set: set):
+    # ------------------------------------------------------------------ #
+    # Snapshot-level stable references
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _linux_role(control) -> str:
+        role_name = control.getRoleName() or "unknown"
+        return ROLE_MAPPING.get(role_name.lower(), role_name.replace(" ", "_").lower())
+
+    def _node_id(self, control):
         try:
-            try:
-                key = control
-                hash(key)
-            except Exception:
-                key = id(control)
-            if key not in keep_set:
-                return
-                
-            role_name = control.getRoleName() or "unknown"
-            role = ROLE_MAPPING.get(role_name.lower(), role_name.replace(" ", "_").lower())
+            hash(control)
+            return ("linux-atspi", control)
+        except Exception:
+            return ("linux-obj", id(control))
+
+    def _is_visible(self, control) -> bool:
+        try:
+            # pyrefly: ignore [missing-import]
+            import pyatspi
+            state = control.getState()
+            return not state.contains(pyatspi.STATE_ICONIFIED)
+        except Exception:
+            return True
+
+    def _build_view(self, control=None) -> NodeView:
+        control = self._control if control is None else control
+        try:
+            role = self._linux_role(control)
             name = control.name or ""
         except Exception:
-            return
-        
-        indent = "  " * depth
-        line = f"{indent}- {role}"
-        if name:
-            safe_name = name.replace('"', '\\"')
-            line += f' "{safe_name}"'
-            
+            role, name = "unknown", ""
+        view = NodeView(
+            role=role,
+            name=str(name),
+            node_id=self._node_id(control),
+            control=control,
+            visible=self._is_visible(control),
+        )
         try:
             child_count = control.childCount
+            children = [
+                control.getChildAtIndex(i)
+                for i in range(child_count)
+                if control.getChildAtIndex(i)
+            ]
         except Exception:
-            child_count = 0
+            children = []
+        view.children = [self._build_view(child) for child in children]
+        return view
 
-        valid_children = []
-        if child_count > 0:
-            for i in range(child_count):
-                try:
-                    child = control.getChildAtIndex(i)
-                    if child:
-                        try:
-                            ckey = child
-                            hash(ckey)
-                        except Exception:
-                            ckey = id(child)
-                        if ckey in keep_set:
-                            valid_children.append(child)
-                except Exception:
-                    pass
+    def _window_key(self) -> str:
+        return f"linux:name:{self._control.name or ''}:obj:{id(self._control)}"
 
-        if valid_children and depth < max_depth:
-            line += ":"
-            lines.append(line)
-            for child in valid_children:
-                self._to_yaml_recursive(child, depth + 1, max_depth, lines, keep_set)
-        else:
-            lines.append(line)
+    def to_snapshot(self, max_depth: int = 15):
+        content_root = self._get_content_root(self._control)
+        root_view = self._build_view(content_root)
+        store = get_registry().store(self._window_key())
+        return store.create(root_view, max_depth=max_depth)
+
+    def to_yaml_snapshot(self, max_depth: int = 15) -> str:
+        return self.to_snapshot(max_depth=max_depth).to_yaml()
+
+    def _live_root_view(self) -> NodeView:
+        return self._build_view(self._get_content_root(self._control))
+
+    def resolve_ref(self, ref: str) -> 'UIElement':
+        store = get_registry().store(self._window_key())
+        _, _, live_view = store.resolve(ref, live_root=self._live_root_view())
+        return UIElement(live_view.control, highlight_actions=self.highlight_actions)
+
+    def click_ref(self, ref: str) -> 'LinuxUIElement':
+        return self.resolve_ref(ref)._backend.click()
+
+    def type_ref(self, ref: str, text: str, waitTime: float = 0.05) -> 'LinuxUIElement':
+        self.resolve_ref(ref)._backend.type(text, waitTime)
+        return self
+
+    def read_ref(self, ref: str) -> str:
+        return self.resolve_ref(ref).read()
 
 class UIElement:
     def __init__(self, control, highlight_actions: bool = False):
@@ -1434,6 +1423,40 @@ class UIElement:
 
     def to_yaml_snapshot(self, max_depth: int = 15) -> str:
         return self._backend.to_yaml_snapshot(max_depth)
+
+    def to_snapshot(self, max_depth: int = 15):
+        """Takes a reference-bearing snapshot; each emitted node has a unique ref.
+
+        The returned :class:`tarsier.core.snapshot.Snapshot` exposes
+        ``to_yaml()`` / ``to_json()`` / ``get(ref)`` and is remembered by the
+        window's snapshot store so that :meth:`resolve_ref` can validate the
+        reference on the next action.
+        """
+        return self._backend.to_snapshot(max_depth)
+
+    def to_snapshot_json(self, max_depth: int = 15) -> str:
+        """JSON snapshot including stable refs (non-ASCII names are preserved)."""
+        return self.to_snapshot(max_depth).to_json()
+
+    def resolve_ref(self, ref: str) -> 'UIElement':
+        """Validates ``ref`` against the live tree and returns the element.
+
+        Raises ``StaleSnapshotError``, ``UnknownReferenceError``,
+        ``ReferenceMismatchError``, ``AmbiguousReferenceError`` or
+        ``ElementUnavailableError`` with an explanatory message.
+        """
+        return self._backend.resolve_ref(ref)
+
+    def click_ref(self, ref: str) -> 'UIElement':
+        self._backend.click_ref(ref)
+        return self
+
+    def type_ref(self, ref: str, text: str, waitTime: float = 0.05) -> 'UIElement':
+        self._backend.type_ref(ref, text, waitTime)
+        return self
+
+    def read_ref(self, ref: str) -> str:
+        return self._backend.read_ref(ref)
 
     def to_json(self) -> str:
         return json.dumps(self.dump_ui(), indent=2)

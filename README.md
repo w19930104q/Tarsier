@@ -178,6 +178,57 @@ notepad.button("Submit").click()
 notepad.textbox("Username").type("Hello from Tarsier!")
 ```
 
+### 2.5 Stable Snapshot References (refs)
+A semantic `find(role=..., name=...)` only returns the **first** match, which is
+unsafe when a table contains many identically named controls (e.g. a row of
+`删除` / "Delete" buttons). After a window refresh the same search can silently
+target the wrong row.
+
+Tarsier therefore attaches a **unique, snapshot-level reference** to every
+actionable and visible text node. Take a snapshot once, then drive exact nodes
+by ref; each action re-validates the reference against the *live* tree first.
+
+```python
+# YAML keeps its token-efficient shape; each node now carries "# ref=...".
+print(window.to_yaml_snapshot())
+# - window "订单管理":  # ref=wa1b2c3d:s0n0
+#   - group:  # ref=wa1b2c3d:s0n1
+#     - text "订单1"  # ref=wa1b2c3d:s0n2
+#     - button "删除"  # ref=wa1b2c3d:s0n3
+#   - group:  # ref=wa1b2c3d:s0n4
+#     - text "订单2"  # ref=wa1b2c3d:s0n5
+#     - button "删除"  # ref=wa1b2c3d:s0n6   <- same name, different ref
+
+# Structured JSON (refs are fields; non-ASCII names are preserved)
+snapshot = window.to_snapshot()
+payload = snapshot.to_json()
+
+# Act on an exact node — duplicate names are no longer ambiguous.
+window.click_ref("wa1b2c3d:s0n6")
+window.type_ref("wa1b2c3d:s0n9", "加急处理")
+content = window.read_ref("wa1b2c3d:s0n2")
+
+# The same Snapshot object also resolves refs programmatically.
+element = window.resolve_ref("wa1b2c3d:s0n6")
+```
+
+A reference is opaque and encodes both the window identity and the snapshot
+generation (`w<window>:s<generation>n<index>`). Before every ref-based action
+Tarsier checks:
+
+1. **Window generation** — after a re-snapshot/refresh, old refs raise
+   `StaleSnapshotError`; refs from another (replaced) window raise
+   `UnknownReferenceError`.
+2. **Role/name** — if the live element changed role or name,
+   `ReferenceMismatchError` is raised instead of acting blindly.
+3. **Ambiguity & availability** — multiple live matches raise
+   `AmbiguousReferenceError`; vanished/invisible nodes raise
+   `ElementUnavailableError`.
+
+The fix is always the same: take a fresh snapshot and use a current ref.
+Existing `find` / exact-name / `regex_name` APIs are unchanged — refs are
+purely additive, and `to_yaml_snapshot()` keeps its historical line shape.
+
 ### 3. Web Automation with Lifecycle Safety
 Tarsier also supports web automation via Playwright with built-in context manager safety:
 
@@ -233,23 +284,23 @@ The Tarsier MCP server exposes **21 tools** categorized into Desktop and Web aut
   * **Arguments**: `executable: str`, `window_name: str = None`
   * **Description**: Launches a local application (e.g. `notepad.exe`, `calc.exe`, `code`) and attaches to its active window.
 * 🔍 **`desktop_get_ui`**
-  * **Arguments**: `window_name: str`
-  * **Description**: Recursively scans the target window up to 15 layers deep and outputs the pruned, token-efficient YAML snapshot.
+  * **Arguments**: `window_name: str`, `format: str = "yaml"`, `max_depth: int = 15`
+  * **Description**: Recursively scans the target window up to `max_depth` layers and outputs the pruned, token-efficient snapshot (YAML with `# ref=...` comments, or JSON with `ref` fields). Every actionable/visible node gets a unique stable reference that disambiguates duplicate names; subtrees past the depth limit are explicitly marked `[truncated]`.
 * 🖱️ **`desktop_click`**
-  * **Arguments**: `window_name: str`, `role: str`, `name: str`
-  * **Description**: Semantically clicks a targeted element matching the exact accessibility role and name.
+  * **Arguments**: `window_name: str`, `role: str = None`, `name: str = None`, `ref: str = None`
+  * **Description**: Clicks a targeted element. Pass `ref` (from the latest snapshot) to target an exact node even when names repeat; otherwise legacy `role`/`name` exact matching is used. Stale, foreign-window, malformed, ambiguous or role/name-mismatched refs return an explicit error and never click the wrong row.
 * 🖱️ **`desktop_right_click`**
-  * **Arguments**: `window_name: str`, `role: str`, `name: str`
-  * **Description**: Performs a right-click on the specified semantic element.
+  * **Arguments**: `window_name: str`, `role: str = None`, `name: str = None`, `ref: str = None`
+  * **Description**: Performs a right-click on the specified element, identified by stable ref or role/name.
 * 🕳️ **`desktop_hover`**
-  * **Arguments**: `window_name: str`, `role: str`, `name: str`
-  * **Description**: Moves the physical mouse cursor to hover over the targeted element.
+  * **Arguments**: `window_name: str`, `role: str = None`, `name: str = None`, `ref: str = None`
+  * **Description**: Moves the physical mouse cursor to hover over the targeted element, identified by stable ref or role/name.
 * ⌨️ **`desktop_type`**
-  * **Arguments**: `window_name: str`, `role: str`, `name: str`, `text: str`
-  * **Description**: Focuses an input field (e.g. `textbox`, `document`, `edit`) and injects text.
+  * **Arguments**: `window_name: str`, `role: str = None`, `name: str = None`, `text: str = ""`, `ref: str = None`
+  * **Description**: Focuses an input field (e.g. `textbox`, `document`, `edit`) and injects text, identified by stable ref or role/name. The ref is re-validated against the live tree before any keystroke.
 * 📖 **`desktop_read_text`**
-  * **Arguments**: `window_name: str`, `role: str`, `name: str`
-  * **Description**: Reads and returns the raw string value of a specific element (like a text document).
+  * **Arguments**: `window_name: str`, `role: str = None`, `name: str = None`, `ref: str = None`
+  * **Description**: Reads and returns the raw string value of a specific element. Use `ref` to read a specific row when a table contains repeated names.
 * ⌨️ **`desktop_hotkey`**
   * **Arguments**: `keys: str`
   * **Description**: Triggers a global keyboard shortcut (e.g. `{Ctrl}s`, `{Alt}{Tab}`). Supports modifier token parsing.
@@ -344,6 +395,24 @@ Add Tarsier to your `claude_desktop_config.json`:
   }
 }
 ```
+
+---
+
+## 🧪 Testing
+
+The stable-reference logic is platform-neutral and covered by unit regressions
+that run on a simulated accessibility tree — **no desktop session, display
+server or platform automation library is required**.
+
+```bash
+python3 -I tests/run_all.py          # or: python3 -m unittest discover -s tests
+```
+
+The suite covers duplicate role/name nodes (the multiple `删除` buttons case),
+nodes moving within a generation, window refresh (stale generation), window
+replacement (isolated stores), non-ASCII names, pruning semantics, preorder
+numbering, depth truncation, YAML escaping/JSON round-trips, and backwards
+compatibility of the legacy exact/regex `find` API and MCP signatures.
 
 ---
 

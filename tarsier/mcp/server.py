@@ -7,11 +7,28 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
 from tarsier import Desktop
+from tarsier.core.snapshot import SnapshotError
 
 # Initialize FastMCP Server
 mcp = FastMCP("Tarsier Automation")
 desktop = Desktop()
 web_desktop = None
+
+
+def _resolve_element(window, role: Optional[str], name: Optional[str], ref: Optional[str]):
+    """Resolves a target element either by stable snapshot ref or legacy role/name.
+
+    When ``ref`` is supplied it is validated against the live tree (window
+    generation, role/name, visibility and ambiguity checks) before any action.
+    The role/name path is unchanged for backwards compatibility.
+    """
+    if ref:
+        return window.resolve_ref(ref)
+    return window.find(role=role, name=name)
+
+
+def _describe_target(role: Optional[str], name: Optional[str], ref: Optional[str]) -> str:
+    return f"ref='{ref}'" if ref else f"role='{role}', name='{name}'"
 
 def get_web(headless: bool = False):
     """Lazy loads the WebDesktop so Chromium isn't started unless requested."""
@@ -37,109 +54,137 @@ def desktop_open_app(executable: str, window_name: str = None) -> str:
         return f"Error opening app: {e}"
 
 @mcp.tool()
-def desktop_get_ui(window_name: str) -> str:
+def desktop_get_ui(window_name: str, format: str = "yaml", max_depth: int = 15) -> str:
     """
-    Retrieves the entire semantic UI tree (Desktop DOM) for a specific window in JSON format.
-    Use this to see what buttons, textboxes, and menus are currently on the screen.
-    
+    Retrieves the entire semantic UI tree (Desktop DOM) for a specific window.
+    Every actionable and visible text node carries a unique stable reference
+    (e.g. 's0n7') shown as '# ref=...' comments in YAML or as 'ref' fields in
+    JSON. Pass that ref to desktop_click/desktop_type/desktop_read_text to
+    target the exact node even when several elements share the same name.
+
     Args:
         window_name: The name of the window to inspect.
+        format: 'yaml' (default, token-efficient) or 'json' (structured with refs).
+        max_depth: Maximum tree depth to emit; deeper subtrees are marked truncated.
     """
     try:
         window = desktop.get_window(window_name)
-        return window.to_yaml_snapshot()
+        snapshot = window.to_snapshot(max_depth=max_depth)
+        if format.lower() == "json":
+            return snapshot.to_json()
+        return snapshot.to_yaml()
     except Exception as e:
         return f"Error getting UI: {e}"
 
 @mcp.tool()
-def desktop_click(window_name: str, role: str, name: str) -> str:
+def desktop_click(window_name: str, role: str = None, name: str = None, ref: str = None) -> str:
     """
-    Semantically finds a UI element inside a window and clicks it.
-    
+    Clicks a UI element inside a window, either by its stable snapshot ref or
+    by semantic role/name. Prefer ref when the snapshot contains duplicate
+    names. A stale, malformed or ambiguous ref returns an explicit error and
+    never clicks the wrong row.
+
     Args:
         window_name: The name of the window containing the element.
-        role: The semantic role of the element (e.g. 'button', 'menuitem', 'tab').
-        name: The exact semantic name of the element (e.g. 'Save', 'File').
+        role: Semantic role (e.g. 'button'); ignored when ref is given.
+        name: Exact semantic name (e.g. '删除'); ignored when ref is given.
+        ref: Stable reference from the latest desktop_get_ui snapshot, e.g. 's0n7'.
     """
     try:
         window = desktop.get_window(window_name)
-        element = window.find(role=role, name=name)
+        element = _resolve_element(window, role, name, ref)
         element.click()
-        return f"Successfully clicked the '{name}' {role}."
+        return f"Successfully clicked the element ({_describe_target(role, name, ref)})."
+    except SnapshotError as e:
+        return f"Snapshot reference error: {e}"
     except Exception as e:
         return f"Error clicking element: {e}"
 
 @mcp.tool()
-def desktop_right_click(window_name: str, role: str, name: str) -> str:
+def desktop_right_click(window_name: str, role: str = None, name: str = None, ref: str = None) -> str:
     """
-    Semantically finds a UI element inside a window and right-clicks it.
-    
+    Right-clicks a UI element, identified by stable snapshot ref or role/name.
+
     Args:
         window_name: The name of the window containing the element.
-        role: The semantic role of the element (e.g. 'button', 'menuitem', 'tab').
-        name: The exact semantic name of the element (e.g. 'Save', 'File').
+        role: Semantic role (e.g. 'button'); ignored when ref is given.
+        name: Exact semantic name; ignored when ref is given.
+        ref: Stable reference from the latest desktop_get_ui snapshot.
     """
     try:
         window = desktop.get_window(window_name)
-        element = window.find(role=role, name=name)
+        element = _resolve_element(window, role, name, ref)
         element.right_click()
-        return f"Successfully right-clicked the '{name}' {role}."
+        return f"Successfully right-clicked the element ({_describe_target(role, name, ref)})."
+    except SnapshotError as e:
+        return f"Snapshot reference error: {e}"
     except Exception as e:
         return f"Error right-clicking element: {e}"
 
 @mcp.tool()
-def desktop_hover(window_name: str, role: str, name: str) -> str:
+def desktop_hover(window_name: str, role: str = None, name: str = None, ref: str = None) -> str:
     """
-    Semantically finds a UI element inside a window and hovers the mouse cursor over it.
-    
+    Hovers the mouse cursor over a UI element, identified by snapshot ref or role/name.
+
     Args:
         window_name: The name of the window containing the element.
-        role: The semantic role of the element.
-        name: The exact semantic name of the element.
+        role: Semantic role; ignored when ref is given.
+        name: Exact semantic name; ignored when ref is given.
+        ref: Stable reference from the latest desktop_get_ui snapshot.
     """
     try:
         window = desktop.get_window(window_name)
-        element = window.find(role=role, name=name)
+        element = _resolve_element(window, role, name, ref)
         element.hover()
-        return f"Successfully hovered over the '{name}' {role}."
+        return f"Successfully hovered over the element ({_describe_target(role, name, ref)})."
+    except SnapshotError as e:
+        return f"Snapshot reference error: {e}"
     except Exception as e:
         return f"Error hovering element: {e}"
 
 @mcp.tool()
-def desktop_type(window_name: str, role: str, name: str, text: str) -> str:
+def desktop_type(window_name: str, role: str = None, name: str = None, text: str = "", ref: str = None) -> str:
     """
-    Semantically finds a textbox or input field and types text into it.
-    
+    Types text into a textbox/input field, identified by stable snapshot ref
+    or semantic role/name. Ref-based typing is validated against the live tree
+    before any keystroke is sent.
+
     Args:
         window_name: The name of the window containing the element.
-        role: The semantic role of the element (e.g. 'document', 'edit').
-        name: The name of the element (optional if there's only one main document, but best to provide).
+        role: Semantic role (e.g. 'document', 'edit'); ignored when ref is given.
+        name: Name of the element; ignored when ref is given.
         text: The text to inject.
+        ref: Stable reference from the latest desktop_get_ui snapshot.
     """
     try:
         window = desktop.get_window(window_name)
-        element = window.find(role=role, name=name)
+        element = _resolve_element(window, role, name, ref)
         element.type(text)
-        return f"Successfully typed text into the '{name}' {role}."
+        return f"Successfully typed text into the element ({_describe_target(role, name, ref)})."
+    except SnapshotError as e:
+        return f"Snapshot reference error: {e}"
     except Exception as e:
         return f"Error typing text: {e}"
 
 @mcp.tool()
-def desktop_read_text(window_name: str, role: str, name: str) -> str:
+def desktop_read_text(window_name: str, role: str = None, name: str = None, ref: str = None) -> str:
     """
-    Reads and returns the textual contents of a specific UI element (like a document or textbox).
-    Use this to read the contents of an open file or field without dumping the entire UI tree.
-    
+    Reads and returns the textual contents of a UI element, identified by
+    stable snapshot ref or role/name. Use ref to read a specific row when a
+    table contains repeated names.
+
     Args:
         window_name: The name of the window containing the element.
-        role: The semantic role of the element (e.g. 'document', 'edit').
-        name: The exact semantic name of the element.
+        role: Semantic role (e.g. 'document', 'edit'); ignored when ref is given.
+        name: Exact semantic name; ignored when ref is given.
+        ref: Stable reference from the latest desktop_get_ui snapshot.
     """
     try:
         window = desktop.get_window(window_name)
-        element = window.find(role=role, name=name)
-        content = element.read()
-        return content
+        element = _resolve_element(window, role, name, ref)
+        return element.read()
+    except SnapshotError as e:
+        return f"Snapshot reference error: {e}"
     except Exception as e:
         return f"Error reading text: {e}"
 
